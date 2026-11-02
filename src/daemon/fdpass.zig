@@ -43,9 +43,11 @@ pub fn recv(stream: net.Stream, io: std.Io, buf: []u8) !Received {
     var it: net.cmsg.Iterator = .{ .control = control[0..r.control_len] };
     while (it.next()) |m| {
         if (m.header.level != std.c.SOL.SOCKET or m.header.type != std.c.SCM.RIGHTS) continue;
-        var fds = m.data;
-        while (fds.len >= @sizeOf(fd_t)) : (fds = fds[@sizeOf(fd_t)..]) {
-            const got = std.mem.bytesToValue(fd_t, fds[0..@sizeOf(fd_t)]);
+        // by offset: slicing the data would change its alignment, which
+        // differs between macOS and Linux
+        var off: usize = 0;
+        while (m.data.len - off >= @sizeOf(fd_t)) : (off += @sizeOf(fd_t)) {
+            const got = std.mem.bytesToValue(fd_t, m.data[off..][0..@sizeOf(fd_t)]);
             if (fd != null) {
                 _ = std.c.close(got);
                 continue;
