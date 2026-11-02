@@ -255,6 +255,127 @@ api.nvim_create_autocmd('WinClosed', {
   end,
 })
 
+-- Terminals: a program in one sets its title and reports its status
+-- (OSC 7501), and the Rex pane of each window showing it gets them, as if
+-- the program ran in that pane. Rex names tabs from the title and shows
+-- progress and "needs you" from the status.
+
+-- terminal buffer -> { title = string, records = { [id] = report body } }
+local terms = {}
+
+-- one pair of a report body, such as 'id' in 'state=done:id=build'
+local function field(body, key)
+  local value
+  for pair in body:gmatch('[^:]+') do
+    local k, v = pair:match('^%s*(%l+)%s*=%s*(.-)%s*$')
+    if k == key then value = v end
+  end
+  return value
+end
+
+-- the window's terminal title and records, or nothing for any other buffer
+local function term_note(win)
+  if not shown(win) then return end
+  local t = terms[api.nvim_win_get_buf(win)]
+  local records = {}
+  if t then
+    for id, body in pairs(t.records) do table.insert(records, { id, body }) end
+  end
+  vim.rpcnotify(chan, 'neorex_term', win, t and t.title or '', records)
+end
+
+local function term_push(buf)
+  for _, win in ipairs(vim.fn.win_findbuf(buf)) do term_note(win) end
+end
+
+-- from the term_title watcher
+function M.term_title(buf, title)
+  local t = terms[buf]
+  if not t then return end
+  t.title = type(title) == 'string' and title or ''
+  term_push(buf)
+end
+
+-- applies a report as the spec says: each replaces its record; a clear
+-- removes its record and those under it, or every record without an id
+local function apply_report(t, body)
+  local state = field(body, 'state')
+  local id = field(body, 'id') or ''
+  if state == 'clear' then
+    if id == '' then
+      t.records = {}
+    else
+      for k in pairs(t.records) do
+        if k == id or k:sub(1, #id + 1) == id .. '/' then t.records[k] = nil end
+      end
+    end
+  elseif state then
+    t.records[id] = body
+  end
+end
+
+api.nvim_create_autocmd('TermOpen', {
+  group = group,
+  callback = function(ev)
+    local buf = ev.buf
+    terms[buf] = { title = vim.b[buf].term_title or '', records = {} }
+    vim.cmd(string.format(
+      "call dictwatcheradd(getbufvar(%d, ''), 'term_title', {d, k, c -> v:lua.neorex.term_title(%d, get(c, 'new', ''))})",
+      buf, buf))
+    term_push(buf)
+  end,
+})
+
+api.nvim_create_autocmd('TermRequest', {
+  group = group,
+  callback = function(ev)
+    local t = terms[ev.buf]
+    if not t then return end
+    local seq = type(ev.data) == 'table' and ev.data.sequence or vim.v.termrequest
+    local body = seq:match('^\027%]7501;(.*)$')
+    if not body then return end
+    -- a program asks whether status is supported before it reports any;
+    -- answered here, as Rex would, since Rex never sees the question
+    if body:sub(1, 1) == '?' then
+      pcall(api.nvim_chan_send, vim.bo[ev.buf].channel, '\027]7501;?\027\\')
+      return
+    end
+    apply_report(t, body)
+    term_push(ev.buf)
+  end,
+})
+
+-- the program exited: drop what only lasts while it runs, as Rex would
+api.nvim_create_autocmd('TermClose', {
+  group = group,
+  callback = function(ev)
+    local t = terms[ev.buf]
+    if not t then return end
+    for id, body in pairs(t.records) do
+      local state = field(body, 'state')
+      if state ~= 'done' and state ~= 'error' then t.records[id] = nil end
+    end
+    term_push(ev.buf)
+  end,
+})
+
+api.nvim_create_autocmd({ 'BufWipeout', 'BufDelete' }, {
+  group = group,
+  callback = function(ev) terms[ev.buf] = nil end,
+})
+
+-- another buffer in a window: its pane shows that one's, or nothing.
+-- After the command, so a split of a terminal is counted too.
+api.nvim_create_autocmd({ 'BufWinEnter', 'WinNew' }, {
+  group = group,
+  callback = function()
+    local win = api.nvim_get_current_win()
+    vim.schedule(function()
+      if api.nvim_win_is_valid(win) then term_note(win) end
+    end)
+  end,
+})
+
 local first = api.nvim_get_current_win()
 M.adopt(first, cols, rows)
 schedule_report()

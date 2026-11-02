@@ -82,6 +82,26 @@ pub const Note = union(enum) {
     float: i64,
     /// This float was just entered; sent before the redraw that shows it.
     entered: i64,
+    /// What a window's pane should show of its terminal's title and status.
+    term: Term,
+};
+
+/// A window's terminal title and program status records; empty for a
+/// window that isn't showing a terminal.
+pub const Term = struct {
+    win: i64,
+    title: []const u8,
+    /// How many `[id, body]` pairs `records` holds.
+    count: u32,
+    /// Positioned at the first pair; read them with `nextRecord`.
+    records: msgpack.Decoder,
+
+    pub fn nextRecord(self: *Term) !?[2][]const u8 {
+        if (self.count == 0) return null;
+        self.count -= 1;
+        if (try rpc.expectArray(&self.records) < 2) return error.BadMessage;
+        return .{ try rpc.expectStr(&self.records), try rpc.expectStr(&self.records) };
+    }
 };
 
 /// Where a new window sits in Neovim's layout.
@@ -107,15 +127,27 @@ pub fn parseNote(method: []const u8, params: *msgpack.Decoder) !?Note {
         .float
     else if (std.mem.eql(u8, method, "neorex_entered"))
         .entered
+    else if (std.mem.eql(u8, method, "neorex_term"))
+        .term
     else
         return null;
-    if (try rpc.expectArray(params) < if (tag == .split) @as(u32, 4) else 1) return error.BadMessage;
+    const want: u32 = switch (tag) {
+        .split => 4,
+        .term => 3,
+        else => 1,
+    };
+    if (try rpc.expectArray(params) < want) return error.BadMessage;
     const win = try rpc.expectHandle(params);
     return switch (tag) {
         .current => .{ .current = win },
         .reopen => .{ .reopen = win },
         .float => .{ .float = win },
         .entered => .{ .entered = win },
+        .term => blk: {
+            const title = try rpc.expectStr(params);
+            const count = try rpc.expectArray(params);
+            break :blk .{ .term = .{ .win = win, .title = title, .count = count, .records = params.* } };
+        },
         .split => .{ .split = .{
             .win = win,
             .side_by_side = try rpc.expectBool(params),
@@ -152,6 +184,8 @@ const Harness = struct {
     /// The windows a check waits for.
     want: i64 = 0,
     gone: i64 = 0,
+    /// The last `term` note, copied: a note's text is only valid until the next read.
+    term: struct { win: i64 = 0, title: [64]u8 = undefined, title_len: usize = 0, body: [128]u8 = undefined, body_len: usize = 0, count: u32 = 0 } = .{},
 
     fn deinit(h: *Harness) void {
         h.grids.deinit(testing.allocator);
@@ -172,7 +206,10 @@ const Harness = struct {
                     var params = n.params;
                     if (std.mem.eql(u8, n.method, "redraw")) {
                         _ = try h.grids.applyRedraw(gpa, &params);
-                    } else if (try parseNote(n.method, &params)) |note| try h.notes.append(gpa, note);
+                    } else if (try parseNote(n.method, &params)) |note| switch (note) {
+                        .term => |t| h.keepTerm(t) catch return error.BadMessage,
+                        else => try h.notes.append(gpa, note),
+                    };
                 },
                 .response => |r| {
                     if (r.err) |e| {
@@ -195,6 +232,25 @@ const Harness = struct {
         _ = try h.nvim.request("nvim_input", 1);
         try msgpack.writeStr(h.nvim.writer(), keys);
         try h.nvim.flush();
+    }
+
+    fn keepTerm(h: *Harness, note: Term) !void {
+        var t = note;
+        h.term = .{ .win = t.win, .count = t.count };
+        h.term.title_len = @min(t.title.len, h.term.title.len);
+        @memcpy(h.term.title[0..h.term.title_len], t.title[0..h.term.title_len]);
+        while (try t.nextRecord()) |r| {
+            h.term.body_len = @min(r[1].len, h.term.body.len);
+            @memcpy(h.term.body[0..h.term.body_len], r[1][0..h.term.body_len]);
+        }
+    }
+
+    fn termTitle(h: *const Harness) []const u8 {
+        return h.term.title[0..h.term.title_len];
+    }
+
+    fn termBody(h: *const Harness) []const u8 {
+        return h.term.body[0..h.term.body_len];
     }
 
     fn lastCurrent(h: *const Harness) i64 {
@@ -385,6 +441,52 @@ test "each window shows a statusline inside its pane" {
     try testing.expect(try h.until(struct {
         fn f(x: *Harness) bool {
             return gridHeight(x, x.wins[0]) == 9 and rowStarts(x, x.wins[0], 8, "MINE");
+        }
+    }.f));
+}
+
+test "a terminal's title and program status reach its window's note" {
+    var buf: [1024]u8 = undefined;
+    var h: Harness = .{ .nvim = Nvim.spawn(testing.io, &.{ "nvim", "--clean", "--embed", "-n" }, &buf) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    } };
+    defer h.deinit();
+    try h.nvim.uiAttach(40, 10, .{ .ext_multigrid = true });
+    h.chan_id = try askChannel(&h.nvim);
+    try h.nvim.flush();
+    try testing.expect(try h.until(struct {
+        fn f(x: *Harness) bool {
+            return x.wins[0] != 0 and x.lastCurrent() == x.wins[0];
+        }
+    }.f));
+
+    // the program reports only once its question is answered, as Claude Code does
+    try h.input(":terminal stty raw -echo; printf '\\033]7501;?\\033\\\\'; " ++
+        "r=$(dd bs=1 count=10 2>/dev/null); " ++
+        "[ \"$r\" = \"$(printf '\\033]7501;?\\033\\\\')\" ] && printf '\\033]7501;state=working:app=test\\033\\\\'; " ++
+        "printf '\\033]2;Fix login\\033\\\\'; sleep 5<CR>");
+    h.want = h.wins[0];
+    try testing.expect(try h.until(struct {
+        fn f(x: *Harness) bool {
+            return x.term.win == x.want and std.mem.eql(u8, x.termTitle(), "Fix login") and
+                x.term.count == 1 and std.mem.eql(u8, x.termBody(), "state=working:app=test");
+        }
+    }.f));
+
+    // another buffer in the window: nothing to show
+    try h.input("<C-\\><C-n>:enew<CR>");
+    try testing.expect(try h.until(struct {
+        fn f(x: *Harness) bool {
+            return x.term.win == x.want and x.termTitle().len == 0 and x.term.count == 0;
+        }
+    }.f));
+
+    // and back: the terminal's again, kept while it was hidden
+    try h.input(":buffer #<CR>");
+    try testing.expect(try h.until(struct {
+        fn f(x: *Harness) bool {
+            return x.term.win == x.want and std.mem.eql(u8, x.termTitle(), "Fix login") and x.term.count == 1;
         }
     }.f));
 }

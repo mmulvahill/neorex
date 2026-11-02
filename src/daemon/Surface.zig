@@ -8,6 +8,7 @@ const Terminal = @import("../term/Terminal.zig");
 const modes = @import("../term/modes.zig");
 const Forwarder = @import("../nvim/Forwarder.zig");
 const PaneView = @import("../screen/PaneView.zig");
+const TermStatus = @import("TermStatus.zig");
 
 const Surface = @This();
 
@@ -19,6 +20,9 @@ forwarder: Forwarder = .{
     .ctrl_q_quits = false,
     .send_focus = false,
 },
+
+/// The terminal title and program status last written to the pane.
+term_sent: TermStatus = .{},
 
 out_buf: [32 * 1024]u8 = undefined,
 
@@ -40,9 +44,12 @@ pub fn create(gpa: std.mem.Allocator, helper_socket: net.Stream, tty: std.posix.
 /// `restore` is false when the terminal is already gone.
 pub fn destroy(self: *Surface, gpa: std.mem.Allocator, io: std.Io, restore: bool) void {
     if (restore) {
+        // the pane neorex was run in goes back to its shell, without our title or status
+        TermStatus.reset(&self.terminal.writer, &self.term_sent) catch {};
         self.terminal.writer.writeAll(modes.editor_off) catch {};
         self.terminal.deinit();
     }
+    self.term_sent.deinit(gpa);
     _ = std.c.close(self.terminal.fd);
     self.helper_socket.close(io);
     gpa.destroy(self);

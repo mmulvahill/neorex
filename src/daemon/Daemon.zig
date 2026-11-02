@@ -24,6 +24,7 @@ const RexSession = @import("../rex/Session.zig");
 const NvimSession = @import("NvimSession.zig");
 const WindowChanges = @import("WindowChanges.zig");
 const Surface = @import("Surface.zig");
+const TermStatus = @import("TermStatus.zig");
 const pane_helper = @import("pane_helper.zig");
 
 const Daemon = @This();
@@ -39,6 +40,8 @@ panes: Panes = .{},
 rex: RexSession,
 nvim: NvimSession,
 changes: WindowChanges = .{},
+/// Each window's terminal title and program status, for its pane to show.
+terms: std.AutoHashMapUnmanaged(i64, TermStatus) = .empty,
 /// Set by `stop`; `run` returns it.
 stopped: ?StopReason = null,
 
@@ -75,6 +78,9 @@ pub fn deinit(self: *Daemon) void {
     self.panes.deinit(self.gpa, self.io);
     self.grids.deinit(self.gpa);
     self.changes.deinit(self.gpa);
+    var it = self.terms.valueIterator();
+    while (it.next()) |t| t.deinit(self.gpa);
+    self.terms.deinit(self.gpa);
     self.rex.deinit();
     self.* = undefined;
 }
@@ -326,6 +332,7 @@ fn paneGone(self: *Daemon, p: *Pane) !void {
     const maybe_win = p.neovim_window_handle;
     self.panes.remove(self.gpa, self.io, i);
     const win = maybe_win orelse return;
+    self.forgetTerm(win);
     try self.changes.markClosing(self.gpa, win);
     try windows.close(self.nvim.client, win);
     try self.nvim.client.flush();
@@ -349,6 +356,7 @@ fn onNvim(self: *Daemon) !void {
                 .entered => |win| try self.onEnteredFloat(win),
                 .reopen => |win| if (self.panes.byWin(win) != null) try self.changes.markReopening(self.gpa, win),
                 .split => |sp| if (self.panes.byWin(sp.win) == null) try self.changes.noteSplit(self.gpa, sp),
+                .term => |t| try self.onTerm(t),
             };
         },
         .request => |r| try self.nvim.client.respondError(r.id, "neorex serves no requests"),
@@ -379,6 +387,35 @@ fn onNvim(self: *Daemon) !void {
             }
         },
     };
+}
+
+/// A window's terminal title or status changed, or it shows another buffer.
+fn onTerm(self: *Daemon, note: windows.Term) !void {
+    var t = note;
+    var next: TermStatus = .{};
+    errdefer next.deinit(self.gpa);
+    try next.setTitle(self.gpa, t.title);
+    while (try t.nextRecord()) |r| try next.putRecord(self.gpa, r[0], r[1]);
+    const entry = try self.terms.getOrPut(self.gpa, t.win);
+    if (entry.found_existing) entry.value_ptr.deinit(self.gpa);
+    entry.value_ptr.* = next;
+    try self.draw();
+}
+
+fn forgetTerm(self: *Daemon, win: i64) void {
+    var kv = self.terms.fetchRemove(win) orelse return;
+    kv.value.deinit(self.gpa);
+}
+
+/// Brings what Rex shows for the pane up to its window's terminal. Returns
+/// whether it wrote anything.
+fn syncTerm(self: *Daemon, p: *const Pane, s: *Surface) bool {
+    // a floating pane, or a window reopening: keep what's shown
+    if (p.layer != null) return false;
+    const win = p.neovim_window_handle orelse return false;
+    const empty: TermStatus = .{};
+    const want = self.terms.getPtr(win) orelse &empty;
+    return TermStatus.sync(self.gpa, &s.terminal.writer, &s.term_sent, want) catch false;
 }
 
 /// Neovim's current window changed: focus its pane in Rex.
@@ -425,10 +462,13 @@ fn reconcile(self: *Daemon) !void {
         const win = p.neovim_window_handle orelse continue;
         if (self.grids.gridOf(win) != null) continue;
         if (self.changes.takeReopening(win)) {
+            // its pane keeps what it shows until the new window says
+            self.forgetTerm(win);
             p.neovim_window_handle = null;
             continue;
         }
         p.closing = .window_closed;
+        self.forgetTerm(win);
         // hanging up closes the Rex pane only once its helper has connected
         if (p.terminal_surface == null) if (p.rex_block) |*b| try self.rex.closeBlock(b);
         self.panes.remove(self.gpa, self.io, i);
@@ -760,6 +800,8 @@ fn draw(self: *Daemon) !void {
         const s = p.terminal_surface orelse continue;
         // a floating pane waiting on its refit shows nothing yet
         if (p.layer != null and !p.layerShown()) continue;
+        // before the frame, so it never lands inside one
+        const synced = self.syncTerm(p, s);
         const drawn = if (p.layer) |*l| blk: {
             var mbuf: [Grids.max_floats]Grids.Placed = undefined;
             const members = FloatGroups.members(&self.grids, &l.group, &mbuf);
@@ -771,7 +813,7 @@ fn draw(self: *Daemon) !void {
             .skip = skip_buf[0..skip_n],
         }, &s.terminal.writer) catch false;
         setTargets(&s.forwarder, s.view.drawnFloats());
-        if (drawn) s.terminal.flush() catch try self.paneGone(p);
+        if (drawn or synced) s.terminal.flush() catch try self.paneGone(p);
     }
     // drawn into one pane at most; done with them
     if (self.grids.msg_grid) |id| if (self.grids.get(id)) |m| {
